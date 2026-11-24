@@ -29,7 +29,11 @@ _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
 class StoreError(Exception):
-    pass
+    """A profile store problem; `code` is the machine-readable kind (`--json`)."""
+
+    def __init__(self, message: str, code: str = "store_error"):
+        super().__init__(message)
+        self.code = code
 
 
 def fpb_home() -> Path:
@@ -40,7 +44,8 @@ def fpb_home() -> Path:
 def validate_name(name: str) -> str:
     if not _NAME.match(name or "") or name in (".", ".."):
         raise StoreError(
-            f"invalid profile name {name!r}: use 1-64 letters, digits, '.', '_' or '-', starting with a letter or digit"
+            f"invalid profile name {name!r}: use 1-64 letters, digits, '.', '_' or '-', starting with a letter or digit",
+            code="invalid_name",
         )
     return name
 
@@ -124,7 +129,7 @@ class Store:
         self.ensure()
         d = self.dir(profile.name)
         if d.exists():
-            raise StoreError(f"profile {profile.name!r} already exists")
+            raise StoreError(f"profile {profile.name!r} already exists", code="profile_exists")
         _private_dir(d)
         _private_dir(d / USER_DATA)
         self.save(profile)
@@ -133,27 +138,32 @@ class Store:
     def save(self, profile: Profile) -> None:
         d = self.dir(profile.name)
         if not d.is_dir():
-            raise StoreError(f"profile {profile.name!r} does not exist")
+            raise StoreError(f"profile {profile.name!r} does not exist", code="profile_not_found")
         _write_private(d / PROFILE_FILE, json.dumps(asdict(profile), indent=2, sort_keys=True) + "\n")
 
     def load(self, name: str) -> Profile:
         path = self.dir(name) / PROFILE_FILE
         if not path.is_file():
-            raise StoreError(f"no profile named {name!r} (see `fpb list`)")
+            raise StoreError(f"no profile named {name!r} (see `fpb list`)", code="profile_not_found")
         mode = stat.S_IMODE(path.stat().st_mode)
         if mode & 0o077:
             # Someone loosened it; the file holds proxy credentials.
             os.chmod(path, 0o600)
-        data = json.loads(path.read_text(encoding="utf-8"))
-        known = {f for f in Profile.__dataclass_fields__}
-        return Profile(**{k: v for k, v in data.items() if k in known})
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            known = {f for f in Profile.__dataclass_fields__}
+            return Profile(**{k: v for k, v in data.items() if k in known})
+        except (ValueError, TypeError, AttributeError) as exc:
+            # The parser's message gives a position, never the content (it holds the proxy password).
+            raise StoreError(f"profile {name!r}: {path} is unreadable ({type(exc).__name__}: {exc})",
+                             code="profile_broken") from None
 
     def delete(self, name: str) -> None:
         d = self.dir(name)
         if not d.exists():
-            raise StoreError(f"no profile named {name!r}")
+            raise StoreError(f"no profile named {name!r}", code="profile_not_found")
         if self.running_pid(name):
-            raise StoreError(f"profile {name!r} is open; close it first (`fpb close {name}`)")
+            raise StoreError(f"profile {name!r} is open; close it first (`fpb close {name}`)", code="profile_open")
         shutil.rmtree(d)
 
     # -- run state -------------------------------------------------------

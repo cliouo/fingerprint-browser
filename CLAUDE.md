@@ -9,9 +9,11 @@
 - `src/fpb/identity.py` — preset choice, identity digest/summary; Camoufox imported lazily
 - `src/fpb/extensions.py` — extension dir validation (gecko id required), host permissions
 - `src/fpb/launcher.py` — builds Camoufox launch options, runs the window (foreground / detached), close detection
+- `src/fpb/extctx.py` — `open --ext-context`: context file checks, hand-off to the detached run, injection into an extension's options page
+- `src/fpb/views.py` — the profile view `--json` prints
 - `src/fpb/doctor.py` — environment checks, reversible macOS font fix (sfnt name parser)
-- `src/fpb/cli.py` — argparse commands
-- `scripts/e2e/` — mock backend, local http/socks5 proxies with auth, single-launch driver (`e2e.py`), Camoufox-only SOCKS5 persistent-context repro, `runner_ext` + `window_lifetime.py` + `bypass_check.sh` (Linux CI, `.github/workflows/linux-e2e.yml`)
+- `src/fpb/cli.py` — argparse commands; `--json` wrapper (`_run_json`)
+- `scripts/e2e/` — mock backend, local http/socks5 proxies with auth, single-launch driver (`e2e.py`), Camoufox-only SOCKS5 persistent-context repro, `runner_ext` (with an options page that takes `--ext-context`) + `window_lifetime.py` + `bypass_check.sh` + `ext_context_check.py` (Linux CI, `.github/workflows/linux-e2e.yml`)
 
 ## Commands
 
@@ -33,7 +35,9 @@ FPB_HOME=/tmp/fpbtest uv run fpb ...   # never test against your real ~/.fpb
 - Camoufox is pinned to stable 0.5.9 (paired browser 158.0.1-beta.41). SOCKS5 with a password is refused at `new`/`set-proxy` (Playwright rejects it).
 - `require_browser()` runs before anything calls `launch_options()`: Camoufox otherwise downloads its paired browser mid-launch and makes it active. To try another build use `HOME=<scratch>` or `e2e.py --executable-path`; never open a profile with a newer browser than fpb uses (Firefox downgrade protection then hangs the older one).
 - Playwright auto-dismisses dialogs unless a listener exists; `run_open` registers a no-op context `dialog` listener so the user can answer them. Keep it.
-- Don't `page.goto` non-http(s) URLs: navigation to `moz-extension://` never reports done and hangs past its timeout. Playwright cannot drive `moz-extension://` pages; end-to-end checks of an extension go through the mock backend's request log (and GUI automation for clicks).
+- Don't `page.goto` non-http(s) URLs: navigation to `moz-extension://` never reports done and hangs past its timeout. Playwright cannot drive `moz-extension://` pages; end-to-end checks of an extension go through the mock backend's request log (and GUI automation for clicks). The one exception is `extctx.inject`: a short `goto(..., wait_until="commit")` whose timeout is expected (the page does open); keep it in a new page that is closed afterwards.
+- `--json`: stdout is exactly one JSON object (`{"ok": true, ...}` exit 0, or `{"ok": false, "error": {"code", "message"}}` exit 1); argparse errors stay exit 2. JSON fields and error codes are an interface other programs rely on: only add, never rename or remove. No password in any view (`proxy` masked, `proxy_user` separate).
+- `--ext-context`: the context (and its base64url) never goes on a command line, into the environment or into any output; the detached run gets it through a 0600 hand-off file it deletes on read. `run.json` `ready` is written only after the injection attempt, so `open --detach` returns with the outcome.
 - Don't touch the installed Camoufox browser files except through `fpb doctor --fix-fonts/--restore-fonts`; test those on a copy (`--fonts-dir/--backup-dir`, hidden flags).
 
 ## Testing with a real browser

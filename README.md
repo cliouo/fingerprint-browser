@@ -61,6 +61,53 @@ fpb set-bypass work1 api.example.com      # or later; 'none' clears it
 - Only the browser's requests to those hosts go direct, and those hosts see this machine's IP, so never list the sites you browse through the proxy. Everything else, and the geoip lookup (exit IP, timezone, geolocation, WebRTC IP), still uses the proxy; `fpb check` shows the bypass next to the proxy's exit IP.
 - Nothing is bypassed by default. `fpb new`/`set-extensions` list the hosts in an extension's `host_permissions` as a hint.
 
+## Driving fpb from another program (`--json`)
+
+`list`, `show`, `new`, `set-proxy`, `set-bypass`, `set-extensions`, `close` and `open --detach` take `--json`. Then stdout carries exactly one JSON object and nothing else (anything meant for a person goes to stderr):
+
+- success: exit 0, `{"ok": true, ...}`;
+- failure: exit 1, `{"ok": false, "error": {"code": "...", "message": "..."}}`;
+- bad arguments: argparse's usual exit 2 with usage on stderr (also `open --json` without `--detach`).
+
+A profile is shown as:
+
+```json
+{"name": "work1", "state": "open", "pid": 41234,
+ "proxy": "http://user:***@203.0.113.10:8000", "proxy_user": "user",
+ "bypass": ["api.example.com"],
+ "extensions": [{"path": "/path/to/dist", "gecko_id": "example-ext@example.com", "name": "Example", "version": "1.2.0", "error": ""}],
+ "identity_digest": "…", "dir": "/home/me/.fpb/profiles/work1", "error": ""}
+```
+
+`state` is `open`, `closed` or `broken` (`profile.json` unreadable: only `name`, `state`, `error`). Without a proxy, `proxy` and `proxy_user` are `""`; `pid` is `null` while closed. The password is always `***`. Fields may be added later, never changed: ignore the ones you do not know.
+
+| command | `--json` result | error codes |
+|---|---|---|
+| `list` | `{"ok": true, "profiles": [<profile>…]}` | — |
+| `show NAME` | `{"ok": true, "profile": <profile>}` (plus `created_at`, `open_pid`, `identity_summary`) | `profile_not_found` |
+| `new NAME …` | `{"ok": true, "profile": <profile>}` | `profile_exists`, `invalid_proxy`, `invalid_extension`, `invalid_bypass`, `browser_missing`, `identity_failed` |
+| `set-proxy NAME URL` | same | `profile_not_found`, `profile_open`, `invalid_proxy` |
+| `set-bypass NAME HOSTS` | same | `profile_not_found`, `profile_open`, `invalid_bypass` |
+| `set-extensions NAME …` | same | `profile_not_found`, `invalid_extension` |
+| `open NAME --detach [--ext-context ID=FILE]` | `{"ok": true, "name", "pid", "log", "ext_context": {"gecko_id", "injected", "error"} or null}` | `profile_not_found`, `already_open`, `invalid_ext_context`, `browser_missing`, `launch_failed`, `launch_timeout` |
+| `close NAME` | `{"ok": true, "name", "was_open", "pid"}` | `profile_not_found`, `close_failed` |
+
+Any command that takes a profile name may also fail with `invalid_name` (bad name) or `profile_broken` (its `profile.json` is unreadable), and any command with `internal` (a bug; details on stderr).
+
+### Passing a context to an extension (`--ext-context`)
+
+`fpb open NAME --ext-context GECKO_ID=FILE` hands an opaque key/value context (FILE: a JSON object, up to 64 KiB) to one of the profile's extensions, for example where a local service listens and the credential to use there. Once the window is up, fpb opens that extension's options page (`options_ui.page`, else `options_page`) as
+
+```
+moz-extension://<uuid>/<options page>#fpbctx=<base64url of FILE, no padding>
+```
+
+and closes it 5 seconds later. The options page should read the hash, erase it at once (`history.replaceState(null, "", location.pathname)`) and keep the context in its own storage; `scripts/e2e/runner_ext/options.js` is a minimal example.
+
+- FILE is read when you run the command; with `--detach` the command returns after the attempt, so you can delete FILE then. The result says whether the page was opened (`injected`) — whether the extension took the context is for the extension to confirm.
+- A problem fpb can see up front (FILE unreadable, empty, too large or not a JSON object; no such extension in the profile; no options page) fails the command with `invalid_ext_context` and starts nothing. A problem in the running browser (the extension's UUID not in `prefs.js` within 15 seconds, the page not opening) gives `injected: false` with the reason, and the window stays open.
+- The context may hold a secret: it never goes on a command line or into the environment. A detached run hands it to its background process through a mode-600 file in the profile directory, deleted as soon as it is read, and the encoded payload is redacted from fpb's output and `open.log`.
+
 ## What is fixed per launch
 
 | | |
@@ -115,7 +162,7 @@ fpb doctor --restore-fonts  # undo
 ## Development
 
 ```sh
-uv run pytest               # unit tests: proxy parsing, profile store, identity, extensions, doctor, CLI, close detection
+uv run pytest               # unit tests: proxy parsing, profile store, identity, extensions, doctor, CLI (+ --json), --ext-context, close detection
 ```
 
 ### How it was tested
@@ -126,9 +173,10 @@ Besides the unit tests (which need no browser), fpb was checked with a real brow
 - proxies: an authenticated HTTP proxy from `scripts/e2e/local_proxy.py`; the browser's exit IP equals the proxy's; a wrong password stops the launch before the browser starts, and the password never appears in any output;
 - extensions: an extension's login (stored in its storage) survives a restart and an in-place update of the extension, checked against `scripts/e2e/mock_backend.py`; an extension that opens its own tabs works (`allow_addon_new_tab`);
 - window lifetime: `--detach` survives killing the launching process group; closing the window ends `fpb open` on macOS and Linux; a minimized window does not;
-- proxy bypass: with `set-bypass`, the backend calls never reach the proxy while other traffic and the geoip lookup still do.
+- proxy bypass: with `set-bypass`, the backend calls never reach the proxy while other traffic and the geoip lookup still do;
+- `--ext-context`: on a new profile and again on a re-open with a new context, the test extension's options page stores exactly the file's object and erases the hash; the context never shows in `ps`, `open.log` or `run.json`.
 
-The Linux part runs in CI (`.github/workflows/linux-e2e.yml`, Xvfb): `scripts/e2e/window_lifetime.py` and `scripts/e2e/bypass_check.sh` with the test extension in `scripts/e2e/runner_ext`. `scripts/e2e/e2e.py` drives a single launch for manual checks (identity probe, screenshot, holding the window for GUI steps).
+The Linux part runs in CI (`.github/workflows/linux-e2e.yml`, Xvfb): `scripts/e2e/window_lifetime.py`, `scripts/e2e/bypass_check.sh` and `scripts/e2e/ext_context_check.py` with the test extension in `scripts/e2e/runner_ext`. `scripts/e2e/e2e.py` drives a single launch for manual checks (identity probe, screenshot, holding the window for GUI steps).
 
 ## License
 

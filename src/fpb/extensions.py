@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 
 class ExtensionError(ValueError):
-    pass
+    code = "invalid_extension"
 
 
 @dataclass(frozen=True)
@@ -26,6 +26,7 @@ class ExtensionInfo:
     version: str
     gecko_id: Optional[str]
     hosts: Tuple[str, ...] = ()  # host names from host_permissions (and MV2 URL permissions)
+    options_page: Optional[str] = None  # options_ui.page or options_page, relative to the extension root
 
     def label(self) -> str:
         gid = self.gecko_id or "NO GECKO ID"
@@ -49,6 +50,14 @@ def permission_hosts(manifest: dict) -> List[str]:
         if host and host not in out:
             out.append(host)
     return out
+
+
+def options_page(manifest: dict) -> Optional[str]:
+    """The extension's options page (path inside the extension), if it declares one."""
+    for page in ((manifest.get("options_ui") or {}).get("page"), manifest.get("options_page")):
+        if isinstance(page, str) and page.strip():
+            return page.strip().lstrip("/").removeprefix("./") or None
+    return None
 
 
 # Never proxied by Firefox anyway, so never worth a bypass hint.
@@ -79,6 +88,7 @@ def inspect_extension(path: str) -> ExtensionInfo:
         version=str(manifest.get("version") or "?"),
         gecko_id=gecko_id(manifest),
         hosts=tuple(permission_hosts(manifest)),
+        options_page=options_page(manifest),
     )
 
 

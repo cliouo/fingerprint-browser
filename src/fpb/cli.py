@@ -3,21 +3,42 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
+import traceback
 import warnings
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from . import __version__
+from . import extctx
 from . import identity as ident
 from .extensions import ExtensionError, bypass_candidates, inspect_extension, validate_extension
 from .proxy import ProxyError, parse_bypass, parse_proxy, redact
 from .store import Profile, Store, StoreError, now_iso, stop_pid, validate_name
+from .views import profile_view
+
+# A command returns an exit code (text output, already printed) or, with
+# --json, the fields of its {"ok": true, ...} result.
+Result = Union[int, Dict[str, Any]]
 
 
 class CliError(Exception):
-    pass
+    def __init__(self, message: str, code: str = "error"):
+        super().__init__(message)
+        self.code = code
+
+
+def _json(args) -> bool:
+    return bool(getattr(args, "json", False))
+
+
+def _bypass(values: List[str]) -> List[str]:
+    try:
+        return parse_bypass(values)
+    except ProxyError as exc:
+        raise CliError(str(exc), code="invalid_bypass") from None
 
 
 def _out(line: str = "") -> None:
@@ -42,7 +63,8 @@ def _check_proxy(url: Optional[str]) -> Optional[str]:
         # authentication"); stable Camoufox (0.5.9) has no way around that.
         raise CliError(
             "SOCKS5 with a user name/password is not supported (the browser driver, Playwright, refuses it). "
-            "Use the provider's HTTP endpoint (http://user:pass@host:port), or a SOCKS5 proxy without a password."
+            "Use the provider's HTTP endpoint (http://user:pass@host:port), or a SOCKS5 proxy without a password.",
+            code="invalid_proxy",
         )
     return proxy.url()
 
@@ -68,7 +90,7 @@ def _bypass_hint(p: Profile) -> None:
 
 def _identity_for_new(store: Store, profile: Profile) -> None:
     """Draw the identity, resolve it through Camoufox once, save digest + summary."""
-    from .launcher import compute_options, require_browser
+    from .launcher import LaunchError, compute_options, require_browser
 
     require_browser()  # the preset pool and the UA version come from the installed build
 
@@ -86,7 +108,10 @@ def _identity_for_new(store: Store, profile: Profile) -> None:
         with warnings.catch_warnings():
             # geoip is off on purpose: this only resolves the identity, no launch
             warnings.filterwarnings("ignore", message=r"When using a proxy")
-            config = ident.config_from_options(compute_options(store, profile, geoip=False))
+            try:
+                config = ident.config_from_options(compute_options(store, profile, geoip=False))
+            except LaunchError as exc:
+                raise CliError(str(exc), code="identity_failed") from None
         screen = profile.identity["preset"].get("screen") or {}
         if config.get("screen.width") == screen.get("width") and config.get("screen.height") == screen.get("height"):
             profile.identity_digest = ident.digest(config)
@@ -96,7 +121,7 @@ def _identity_for_new(store: Store, profile: Profile) -> None:
         # device, or the identity would change with the monitor.
         last_error = f"screen {screen.get('width')}x{screen.get('height')} was cropped by Camoufox"
         used.append(ident.preset_key(profile.identity["preset"]))
-    raise CliError(f"could not draw an identity that fits this display ({last_error})")
+    raise CliError(f"could not draw an identity that fits this display ({last_error})", code="identity_failed")
 
 
 def _print_summary(summary: dict, indent: str = "  ") -> None:
@@ -107,21 +132,23 @@ def _print_summary(summary: dict, indent: str = "  ") -> None:
 # -- commands -----------------------------------------------------------------
 
 
-def cmd_new(store: Store, args) -> int:
+def cmd_new(store: Store, args) -> Result:
     name = validate_name(args.name)
     if store.exists(name):
-        raise CliError(f"profile {name!r} already exists")
+        raise CliError(f"profile {name!r} already exists", code="profile_exists")
     profile = Profile(
         name=name,
         created_at=now_iso(),
         proxy=_check_proxy(args.proxy),
         extensions=_validated_extensions(args.extension, args.allow_no_gecko_id),
-        bypass=parse_bypass(args.bypass),
+        bypass=_bypass(args.bypass),
     )
     if profile.bypass and not profile.proxy:
-        raise CliError("--bypass only applies with --proxy")
+        raise CliError("--bypass only applies with --proxy", code="invalid_bypass")
     _identity_for_new(store, profile)
     store.create(profile)
+    if _json(args):
+        return {"profile": profile_view(store, name)}
     _out(f"created profile {name!r} in {store.dir(name)}")
     _out(f"  proxy: {profile.proxy_masked()}")
     if profile.bypass:
@@ -135,42 +162,69 @@ def cmd_new(store: Store, args) -> int:
     return 0
 
 
-def cmd_open(store: Store, args) -> int:
-    from .launcher import check_browser_for, install_redaction, open_detached, run_open
+def cmd_open(store: Store, args) -> Result:
+    from .launcher import LaunchError, check_browser_for, install_redaction, open_detached, run_open
 
     if args.url and not args.url.lower().startswith(("http://", "https://")):
         # Playwright never sees moz-extension:// or about: pages finish loading.
-        raise CliError("--url must be an http:// or https:// address")
+        raise CliError("--url must be an http:// or https:// address", code="invalid_url")
     profile = store.load(args.name)
-    install_redaction(profile)
+    ctx = None
+    if args.ext_context_handoff:  # the background half of `open --detach --ext-context`
+        ctx = extctx.take_handoff(store, profile.name, args.ext_context_handoff)
+    elif args.ext_context:
+        ctx = extctx.prepare(profile, *args.ext_context)
+    install_redaction(profile, ctx.secrets() if ctx else ())
+    pid = store.running_pid(profile.name)
+    if pid:
+        raise LaunchError(f"profile {profile.name!r} is already open (pid {pid}); `fpb close {profile.name}` to close it",
+                          code="already_open")
     check_browser_for(profile)
     if args.detach:
-        pid = open_detached(store, profile, url=args.url)
+        info = open_detached(store, profile, url=args.url, ext_context=ctx)
+        pid, outcome = info["pid"], info.get("ext_context")
+        if ctx is not None and outcome is None:  # cannot happen with this fpb; be explicit if it does
+            outcome = {"gecko_id": ctx.gecko_id, "injected": False, "error": "the background process did not report"}
+        if _json(args):
+            return {"name": profile.name, "pid": pid, "log": str(store.log_path(profile.name)), "ext_context": outcome}
         _out(f"{profile.name}: window open in the background (pid {pid}); log {store.log_path(profile.name)}")
+        if outcome is not None:
+            if outcome["injected"]:
+                _out(f"  context passed to the options page of {outcome['gecko_id']}")
+            else:
+                _out(f"  context NOT passed to {outcome['gecko_id']}: {outcome['error']}")
         _out(f"close it with the window's close button or: fpb close {profile.name}")
         return 0
     try:
-        run_open(store, profile, url=args.url)
+        run_open(store, profile, url=args.url, ext_context=ctx)
     except KeyboardInterrupt:
         store.clear_run(profile.name)
         return 130
     return 0
 
 
-def cmd_close(store: Store, args) -> int:
+def cmd_close(store: Store, args) -> Result:
     validate_name(args.name)
+    if _json(args) and not store.exists(args.name):
+        raise StoreError(f"no profile named {args.name!r}", code="profile_not_found")
     pid = store.running_pid(args.name)
     if not pid:
+        if _json(args):
+            return {"name": args.name, "was_open": False, "pid": None}
         _out(f"{args.name} is not open")
         return 0
     if stop_pid(pid):
+        if _json(args):
+            return {"name": args.name, "was_open": True, "pid": pid}
         _out(f"{args.name}: closed (pid {pid})")
         return 0
-    raise CliError(f"{args.name}: pid {pid} did not exit")
+    raise CliError(f"{args.name}: pid {pid} did not exit", code="close_failed")
 
 
-def cmd_list(store: Store, args) -> int:
+def cmd_list(store: Store, args) -> Result:
     names = store.names()
+    if _json(args):
+        return {"profiles": [profile_view(store, name) for name in names]}
     if not names:
         _out(f"no profiles in {store.profiles_dir} (create one with `fpb new <name>`)")
         return 0
@@ -199,17 +253,15 @@ def cmd_list(store: Store, args) -> int:
     return 0
 
 
-def cmd_show(store: Store, args) -> int:
+def cmd_show(store: Store, args) -> Result:
     p = store.load(args.name)
     pid = store.running_pid(p.name)
     if args.json:
-        data = {
-            "name": p.name, "created_at": p.created_at, "proxy": p.proxy_masked(), "bypass": p.bypass,
-            "extensions": p.extensions, "open_pid": pid, "dir": str(store.dir(p.name)),
-            "identity_summary": p.identity_summary, "identity_digest": p.identity_digest,
-        }
-        _out(json.dumps(data, indent=2))
-        return 0
+        view = profile_view(store, p.name)
+        # fields fpb 0.1 printed, kept next to the profile view
+        view.update({"created_at": p.created_at, "open_pid": view.get("pid"),
+                     "identity_summary": p.identity_summary})
+        return {"profile": view}
     _out(f"name:       {p.name}")
     _out(f"created:    {p.created_at}")
     _out(f"state:      {'open (pid %d)' % pid if pid else 'closed'}")
@@ -239,35 +291,41 @@ def cmd_delete(store: Store, args) -> int:
     return 0
 
 
-def cmd_set_proxy(store: Store, args) -> int:
+def cmd_set_proxy(store: Store, args) -> Result:
     p = store.load(args.name)
     if store.running_pid(p.name):
-        raise CliError(f"{p.name} is open; close it first, the proxy applies at the next open")
+        raise CliError(f"{p.name} is open; close it first, the proxy applies at the next open", code="profile_open")
     p.proxy = _check_proxy(args.url)
     store.save(p)
+    if _json(args):
+        return {"profile": profile_view(store, p.name)}
     _out(f"{p.name}: proxy set to {p.proxy_masked()}")
     return 0
 
 
-def cmd_set_bypass(store: Store, args) -> int:
+def cmd_set_bypass(store: Store, args) -> Result:
     p = store.load(args.name)
     if store.running_pid(p.name):
-        raise CliError(f"{p.name} is open; close it first, the bypass list applies at the next open")
+        raise CliError(f"{p.name} is open; close it first, the bypass list applies at the next open", code="profile_open")
     values = [] if [v.strip().lower() for v in args.hosts] in (["none"], [""]) else args.hosts
-    p.bypass = parse_bypass(values)
+    p.bypass = _bypass(values)
     if p.bypass and not p.proxy:
-        raise CliError(f"{p.name} has no proxy; a bypass list only applies with one")
+        raise CliError(f"{p.name} has no proxy; a bypass list only applies with one", code="invalid_bypass")
     store.save(p)
+    if _json(args):
+        return {"profile": profile_view(store, p.name)}
     _out(f"{p.name}: bypass {', '.join(p.bypass) if p.bypass else 'none'}; applies at the next open")
     if p.bypass:
         _out("  these hosts are reached directly and see this machine's IP; everything else, and geoip/timezone/WebRTC, still use the proxy")
     return 0
 
 
-def cmd_set_extensions(store: Store, args) -> int:
+def cmd_set_extensions(store: Store, args) -> Result:
     p = store.load(args.name)
     p.extensions = _validated_extensions(args.extension, args.allow_no_gecko_id)
     store.save(p)
+    if _json(args):
+        return {"profile": profile_view(store, p.name)}
     _out(f"{p.name}: {len(p.extensions)} extension(s); applies at the next open")
     for path in p.extensions:
         _out(f"  {inspect_extension(path).label()}")
@@ -425,24 +483,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bypass", action="append", default=[], metavar="HOSTS",
                    help="hosts reached directly, not via the proxy, e.g. the extension's backend (comma-separated, repeatable)")
     p.add_argument("--allow-no-gecko-id", action="store_true", help="accept extensions without a fixed gecko id")
+    p.add_argument("--json", action="store_true", help="print one JSON object on stdout ({\"ok\": ...}); messages go to stderr")
     p.set_defaults(func=cmd_new)
 
     p = sub.add_parser("open", help="open the profile's window (blocks until it is closed)")
     p.add_argument("name")
     p.add_argument("--url", help="page to load first")
     p.add_argument("-d", "--detach", action="store_true", help="run in the background, survive the terminal closing")
+    p.add_argument("--ext-context", type=extctx.parse_arg, metavar="GECKO_ID=FILE",
+                   help="pass FILE (a JSON object, read now) to that extension's options page once the window is up, "
+                        "as #fpbctx=<base64url>; with --detach, returns after the attempt")
+    p.add_argument("--json", action="store_true", help="with --detach: print one JSON object on stdout")
+    p.add_argument("--ext-context-handoff", help=argparse.SUPPRESS)  # internal: detached run's context file
     p.set_defaults(func=cmd_open)
 
     p = sub.add_parser("close", help="close a profile's window")
     p.add_argument("name")
+    p.add_argument("--json", action="store_true", help="print one JSON object on stdout ({\"ok\": ...}); messages go to stderr")
     p.set_defaults(func=cmd_close)
 
     p = sub.add_parser("list", help="list profiles")
+    p.add_argument("--json", action="store_true", help="print one JSON object on stdout ({\"ok\": ...}); messages go to stderr")
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("show", help="show a profile (password masked)")
     p.add_argument("name")
-    p.add_argument("--json", action="store_true")
+    p.add_argument("--json", action="store_true", help="print one JSON object on stdout ({\"ok\": ...}); messages go to stderr")
     p.set_defaults(func=cmd_show)
 
     p = sub.add_parser("delete", help="delete a profile and its browser data")
@@ -453,17 +519,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("set-proxy", help="change a profile's proxy ('none' for direct)")
     p.add_argument("name")
     p.add_argument("url")
+    p.add_argument("--json", action="store_true", help="print one JSON object on stdout ({\"ok\": ...}); messages go to stderr")
     p.set_defaults(func=cmd_set_proxy)
 
     p = sub.add_parser("set-bypass", help="hosts that skip the proxy, e.g. the extension's backend (or 'none')")
     p.add_argument("name")
     p.add_argument("hosts", nargs="+", metavar="HOSTS", help="comma/space-separated host names or .domain suffixes, or 'none'")
+    p.add_argument("--json", action="store_true", help="print one JSON object on stdout ({\"ok\": ...}); messages go to stderr")
     p.set_defaults(func=cmd_set_bypass)
 
     p = sub.add_parser("set-extensions", help="replace a profile's extension list")
     p.add_argument("name")
     p.add_argument("--extension", action="append", default=[], metavar="DIR")
     p.add_argument("--allow-no-gecko-id", action="store_true")
+    p.add_argument("--json", action="store_true", help="print one JSON object on stdout ({\"ok\": ...}); messages go to stderr")
     p.set_defaults(func=cmd_set_extensions)
 
     p = sub.add_parser("accept-identity", help="after an expected change (Camoufox upgrade), stop warning about it")
@@ -484,12 +553,54 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _secrets_for(store: Store, args) -> List[str]:
+    """The proxy password of the profile a command was about, to keep it out of any error text."""
+    try:
+        return store.load(args.name).secrets()
+    except Exception:
+        return []
+
+
+def _run_json(store: Store, args) -> int:
+    """Run a command for a program: exactly one JSON object on stdout.
+
+    Success: exit 0, {"ok": true, ...}. Failure: exit 1,
+    {"ok": false, "error": {"code", "message"}}. Anything the command would
+    print for a person goes to stderr instead.
+    """
+    out = sys.stdout
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            result = args.func(store, args)
+        payload: Dict[str, Any] = {"ok": True, **result}
+        code = 0
+    except Exception as exc:
+        known = (CliError, StoreError, ProxyError, ExtensionError, extctx.ExtContextError)
+        from .launcher import LaunchError
+
+        if isinstance(exc, known + (LaunchError,)):
+            err = {"code": exc.code, "message": str(exc)}
+        else:
+            print(traceback.format_exc(), file=sys.stderr, flush=True)
+            err = {"code": "internal", "message": f"{type(exc).__name__}: {exc}"}
+        err["message"] = redact(err["message"], _secrets_for(store, args))
+        payload, code = {"ok": False, "error": err}, 1
+    out.write(json.dumps(payload) + "\n")
+    out.flush()
+    return code
+
+
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "open" and args.json and not args.detach:
+        parser.error("open --json needs --detach (a foreground open runs until the window is closed)")
     store = Store()
+    if _json(args):
+        return _run_json(store, args)
     try:
         return args.func(store, args)
-    except (CliError, StoreError, ProxyError, ExtensionError) as exc:
+    except (CliError, StoreError, ProxyError, ExtensionError, extctx.ExtContextError) as exc:
         print(f"fpb: error: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:

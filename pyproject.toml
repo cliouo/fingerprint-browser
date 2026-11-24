@@ -1,6 +1,6 @@
 [project]
 name = "fingerprint-browser"
-version = "0.1.0"
+version = "0.2.0"
 description = "Minimal Camoufox profile launcher: fixed identity, per-profile proxy, persistent profile, extensions."
 readme = "README.md"
 license = "MIT"
