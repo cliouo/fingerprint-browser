@@ -105,7 +105,7 @@ moz-extension://<uuid>/<options page>#fpbctx=<base64url of FILE, no padding>
 and closes it 5 seconds later. The options page should read the hash, erase it at once (`history.replaceState(null, "", location.pathname)`) and keep the context in its own storage; `scripts/e2e/runner_ext/options.js` is a minimal example.
 
 - FILE is read when you run the command; with `--detach` the command returns after the attempt, so you can delete FILE then. The result says whether the page was opened (`injected`) — whether the extension took the context is for the extension to confirm.
-- A problem fpb can see up front (FILE unreadable, empty, too large or not a JSON object; no such extension in the profile; no options page) fails the command with `invalid_ext_context` and starts nothing. A problem in the running browser (the extension's UUID not in `prefs.js` within 15 seconds, the page not opening) gives `injected: false` with the reason, and the window stays open.
+- A problem fpb can see up front (FILE unreadable, empty, too large or not a JSON object; no such extension in the profile; no options page) fails the command with `invalid_ext_context` and starts nothing. A problem in the running browser (the extension not up within 15 seconds: no UUID in `prefs.js`, or its pages still failing to load while Firefox installs it) gives `injected: false` with the reason, and the window stays open.
 - The context may hold a secret: it never goes on a command line or into the environment. A detached run hands it to its background process through a mode-600 file in the profile directory, deleted as soon as it is read, and the encoded payload is redacted from fpb's output and `open.log`.
 
 ## What is fixed per launch

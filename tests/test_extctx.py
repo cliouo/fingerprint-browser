@@ -67,11 +67,13 @@ def test_handoff_roundtrip_and_guard(tmp_path):
 
 
 class FakePage:
-    def __init__(self, error=None):
-        self.error, self.urls, self.closed = error, [], False
+    def __init__(self, error=None, errors_first=()):
+        self.error, self.errors_first, self.urls, self.closed = error, list(errors_first), [], False
 
     def goto(self, url, **kwargs):
         self.urls.append((url, kwargs))
+        if self.errors_first:
+            raise self.errors_first.pop(0)
         if self.error:
             raise self.error
 
@@ -113,6 +115,21 @@ def test_inject_other_errors_fail_without_leaking_the_payload(user_data):
     assert out["injected"] is False and "NS_ERROR_FAILURE" in out["error"]
     assert CTX.payload not in out["error"] and "Call log" not in out["error"]
     assert page.closed
+
+
+def test_inject_retries_until_the_addon_is_installed(user_data):
+    """A re-launch knows the UUID at once, but the add-on's pages fail until it is installed again."""
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    not_yet = [PlaywrightError("Page.goto: NS_ERROR_NOT_AVAILABLE") for _ in range(3)]
+    page = FakePage(PlaywrightTimeout("Timeout 2000ms exceeded"), errors_first=not_yet)
+    out = extctx.inject(FakeContext(page), user_data, CTX, uuid_wait=5, hold=0, retry=0.01)
+    assert out["injected"] is True and len(page.urls) == 4 and page.closed
+
+    page = FakePage(PlaywrightError("Page.goto: NS_ERROR_NOT_AVAILABLE"))
+    out = extctx.inject(FakeContext(page), user_data, CTX, uuid_wait=0.05, hold=0, retry=0.01)
+    assert out["injected"] is False and "NS_ERROR_NOT_AVAILABLE" in out["error"] and len(page.urls) >= 2
 
 
 def test_inject_without_uuid(tmp_path):

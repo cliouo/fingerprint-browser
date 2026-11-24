@@ -38,8 +38,13 @@ from .store import Profile, Store, _write_private
 
 HASH_KEY = "fpbctx"
 MAX_BYTES = 64 * 1024  # it ends up in a URL
-UUID_WAIT = 15.0  # a first launch writes the extension's UUID to prefs.js a little later
+# How long the extension may take to come up: a first launch writes its UUID to
+# prefs.js a little later; on a later launch the UUID is known at once but the
+# temporary add-on is installed again, and until then its pages fail to load
+# (NS_ERROR_NOT_AVAILABLE).
+UUID_WAIT = 15.0
 NAV_TIMEOUT_MS = 2000
+NAV_RETRY = 1.0  # seconds between navigation attempts while the extension is not up
 PAGE_HOLD = 5.0  # seconds the options page stays open
 HANDOFF_PREFIX = ".ext_context."
 
@@ -183,14 +188,17 @@ def find_uuid(user_data_dir: Path, gecko_id: str, timeout: float = UUID_WAIT) ->
 
 
 def inject(context: Any, user_data_dir: Path, ctx: ExtContext, *, uuid_wait: float = UUID_WAIT,
-           hold: float = PAGE_HOLD) -> Dict[str, Any]:
+           hold: float = PAGE_HOLD, retry: float = NAV_RETRY) -> Dict[str, Any]:
     """Open the options page with the context in its hash; never raises.
 
     Playwright does not see a moz-extension:// page commit or load, so
     page.goto() times out although the page opens. The timeout therefore
-    means "navigation issued"; any other error means it was not.
+    means "navigation issued". Any other error (the add-on not installed
+    yet) is retried until `uuid_wait` seconds after the start; if it
+    persists, the context was not passed.
     """
     result: Dict[str, Any] = {"gecko_id": ctx.gecko_id, "injected": False, "error": ""}
+    deadline = time.monotonic() + uuid_wait
     uuid = find_uuid(user_data_dir, ctx.gecko_id, uuid_wait)
     if not uuid:
         result["error"] = f"no moz-extension UUID for {ctx.gecko_id} in prefs.js after {uuid_wait:.0f}s (extension not loaded?)"
@@ -200,10 +208,16 @@ def inject(context: Any, user_data_dir: Path, ctx: ExtContext, *, uuid_wait: flo
         from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
         page = context.new_page()
-        try:
-            page.goto(ctx.url(uuid), wait_until="commit", timeout=NAV_TIMEOUT_MS)
-        except PlaywrightTimeout:
-            pass
+        while True:
+            try:
+                page.goto(ctx.url(uuid), wait_until="commit", timeout=NAV_TIMEOUT_MS)
+                break
+            except PlaywrightTimeout:
+                break
+            except Exception:
+                if time.monotonic() + retry > deadline:
+                    raise
+                time.sleep(retry)
         result["injected"] = True
         time.sleep(hold)
     except Exception as exc:
