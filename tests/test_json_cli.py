@@ -230,6 +230,8 @@ def test_new_browser_missing_and_identity_failed(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(doctor, "find_browser", lambda: None)
     assert err_code(capsys, "new", "p", "--json") == "browser_missing"
     monkeypatch.setattr(launcher, "require_browser", lambda: None)
+    # the preset pool comes from the installed browser's data; CI has none
+    monkeypatch.setattr(cli.ident, "new_identity", lambda used: {"os": "windows", "locale": "en-US", "preset": {}})
 
     def broken(*_a, **_k):
         raise launcher.LaunchError("could not prepare the launch: boom")
