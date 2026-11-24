@@ -107,3 +107,58 @@ def test_launch_kwargs_bypass(tmp_path, monkeypatch):
                            "bypass": "api.example.com,.x.test"}
     p.bypass = []
     assert "bypass" not in launch_kwargs(Store(), p)["proxy"]
+
+
+def test_run_open_marks_ready_only_after_the_context_attempt(tmp_path, monkeypatch):
+    """`open --detach` returns on `ready`, so the injection outcome must be in run.json by then."""
+    import contextlib
+
+    import camoufox.sync_api
+    import playwright.sync_api
+
+    from fpb import extctx, launcher
+    from fpb.store import Store
+
+    store = Store(tmp_path / "home")
+    p = store.create(Profile(name="p", created_at="", identity={"preset": {"fpb_salt": "x"}}))
+    seen = {}
+
+    class Ctx:
+        pages = ["first page"]
+
+        def on(self, *_):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_inject(context, user_data_dir, ctx):
+        seen["run_during_inject"] = store.read_run("p")
+        return {"gecko_id": ctx.gecko_id, "injected": True, "error": ""}
+
+    monkeypatch.setattr(launcher, "compute_options", lambda *a, **k: {})
+    monkeypatch.setattr(launcher.ident, "config_from_options", lambda o: {})
+    monkeypatch.setattr(camoufox.sync_api, "NewBrowser", lambda *a, **k: Ctx())
+    monkeypatch.setattr(playwright.sync_api, "sync_playwright", lambda: contextlib.nullcontext(None))
+    monkeypatch.setattr(extctx, "inject", fake_inject)
+    ctx = extctx.ExtContext("example-ext@example.com", "o.html", "cGF5bG9hZA")
+    launcher.run_open(store, p, ext_context=ctx, keep_open=False,
+                      on_ready=lambda c: seen.__setitem__("run_when_ready", store.read_run("p")))
+    assert seen["run_during_inject"]["ready"] is False
+    assert seen["run_when_ready"]["ready"] is True
+    assert seen["run_when_ready"]["ext_context"] == {"gecko_id": "example-ext@example.com", "injected": True, "error": ""}
+    assert store.read_run("p") is None  # cleared on close
+
+
+def test_redaction_extends_to_the_context_payload(monkeypatch, capsys):
+    import io
+
+    from fpb import launcher
+
+    monkeypatch.setattr(launcher.sys, "stdout", io.StringIO())
+    monkeypatch.setattr(launcher.sys, "stderr", io.StringIO())
+    p = Profile(name="p", created_at="", proxy="http://u:pw-secret@127.0.0.1:8080")
+    launcher.install_redaction(p)
+    launcher.install_redaction(p, ["PAYLOADB64"])
+    launcher.sys.stdout.write("pw-secret PAYLOADB64")
+    assert launcher.sys.stdout._stream.getvalue() == "*** ***"

@@ -8,12 +8,15 @@ import subprocess
 import sys
 import time
 import warnings
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
 
 from . import identity as ident
 from .extensions import validate_extension
 from .proxy import redact
 from .store import Profile, Store, now_iso
+
+if TYPE_CHECKING:
+    from .extctx import ExtContext
 
 READY_TIMEOUT = 180.0
 EMPTY_WINDOW_GRACE = 3.0
@@ -25,7 +28,11 @@ warnings.filterwarnings("ignore", message=r"Canvas and WebGL readback return ran
 
 
 class LaunchError(Exception):
-    pass
+    """The window could not be opened; `code` is the machine-readable kind (`--json`)."""
+
+    def __init__(self, message: str, code: str = "launch_failed"):
+        super().__init__(message)
+        self.code = code
 
 
 def require_browser():
@@ -41,7 +48,8 @@ def require_browser():
     if install is None:
         raise LaunchError(
             "the Camoufox browser this camoufox package pairs with is not installed: "
-            "run `uv run camoufox fetch`, then `fpb doctor --fix-fonts` (macOS)"
+            "run `uv run camoufox fetch`, then `fpb doctor --fix-fonts` (macOS)",
+            code="browser_missing",
         )
     return install
 
@@ -66,6 +74,9 @@ class RedactingStream:
         self._stream = stream
         self._secrets = [s for s in secrets if s]
 
+    def add(self, secrets: Iterable[str]) -> None:
+        self._secrets += [s for s in secrets if s and s not in self._secrets]
+
     def write(self, text):
         return self._stream.write(redact(text, self._secrets) if self._secrets else text)
 
@@ -73,14 +84,17 @@ class RedactingStream:
         return getattr(self._stream, name)
 
 
-def install_redaction(profile: Profile) -> None:
-    secrets = profile.secrets()
+def install_redaction(profile: Profile, extra: Iterable[str] = ()) -> None:
+    """Redact the proxy password (and `extra`, e.g. an extension context) from stdout/stderr."""
+    secrets = profile.secrets() + [s for s in extra if s]
     if not secrets:
         return
-    if not isinstance(sys.stdout, RedactingStream):
-        sys.stdout = RedactingStream(sys.stdout, secrets)
-    if not isinstance(sys.stderr, RedactingStream):
-        sys.stderr = RedactingStream(sys.stderr, secrets)
+    for attr in ("stdout", "stderr"):
+        stream = getattr(sys, attr)
+        if isinstance(stream, RedactingStream):
+            stream.add(secrets)
+        else:
+            setattr(sys, attr, RedactingStream(stream, secrets))
 
 
 def launch_kwargs(store: Store, profile: Profile, *, geoip: Any = True, headless: bool = False) -> Dict[str, Any]:
@@ -235,11 +249,14 @@ def _wait_until_closed(context, stop: Dict[str, bool], user_data_dir: Optional[s
 
 
 def run_open(store: Store, profile: Profile, url: Optional[str] = None,
-             on_ready: Optional[Callable[[Any], None]] = None, keep_open: bool = True) -> None:
+             on_ready: Optional[Callable[[Any], None]] = None, keep_open: bool = True,
+             ext_context: Optional["ExtContext"] = None) -> None:
     """Open the profile's window and block until it is closed.
 
     on_ready(context) runs once the browser is up (tests and scripts use it);
     with keep_open=False the window is closed after on_ready returns.
+    ext_context is passed to that extension's options page before the run is
+    marked ready, so `open --detach` returns with the outcome known.
     """
     from camoufox.sync_api import NewBrowser
     from playwright.sync_api import sync_playwright
@@ -247,7 +264,7 @@ def run_open(store: Store, profile: Profile, url: Optional[str] = None,
     name = profile.name
     pid = store.running_pid(name)
     if pid:
-        raise LaunchError(f"profile {name!r} is already open (pid {pid}); `fpb close {name}` to close it")
+        raise LaunchError(f"profile {name!r} is already open (pid {pid}); `fpb close {name}` to close it", code="already_open")
 
     stop = {"v": False}
 
@@ -277,10 +294,22 @@ def run_open(store: Store, profile: Profile, url: Optional[str] = None,
             # the window (e.g. an extension's login prompt()). A listener
             # that does nothing leaves them to the user.
             context.on("dialog", lambda dialog: None)
-            store.write_run(name, {"pid": os.getpid(), "started_at": now_iso(), "ready": True})
-            print(f"[fpb] {name}: window open (pid {os.getpid()}). Close the window to end.", flush=True)
+            run_info: Dict[str, Any] = {"pid": os.getpid(), "started_at": now_iso(), "ready": False}
+            store.write_run(name, run_info)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
+                if ext_context is not None:
+                    from .extctx import inject
+
+                    started = time.monotonic()
+                    outcome = inject(context, store.user_data_dir(name), ext_context)
+                    run_info["ext_context"] = outcome
+                    state = "passed to its options page" if outcome["injected"] else f"NOT passed: {outcome['error']}"
+                    print(f"[fpb] {name}: context for {ext_context.gecko_id} {state} "
+                          f"({time.monotonic() - started:.1f}s)", flush=True)
+                run_info["ready"] = True
+                store.write_run(name, run_info)
+                print(f"[fpb] {name}: window open (pid {os.getpid()}). Close the window to end.", flush=True)
                 if url:
                     try:
                         page.goto(url, wait_until="commit", timeout=60_000)
@@ -302,33 +331,50 @@ def run_open(store: Store, profile: Profile, url: Optional[str] = None,
             signal.signal(sig, handler)
 
 
-def open_detached(store: Store, profile: Profile, url: Optional[str] = None, timeout: float = READY_TIMEOUT) -> int:
-    """Start `fpb open` in its own session and return its pid once the window is up."""
+def open_detached(store: Store, profile: Profile, url: Optional[str] = None, timeout: float = READY_TIMEOUT,
+                  ext_context: Optional["ExtContext"] = None) -> Dict[str, Any]:
+    """Start `fpb open` in its own session; once the window is up, return its run info.
+
+    The run info is run.json: {"pid", "started_at", "ready", "ext_context"?}.
+    An ext_context goes to the background process through a 0600 file in the
+    profile directory (never its command line or environment), which that
+    process deletes as soon as it has read it.
+    """
+    from . import extctx
+
     name = profile.name
     pid = store.running_pid(name)
     if pid:
-        raise LaunchError(f"profile {name!r} is already open (pid {pid})")
+        raise LaunchError(f"profile {name!r} is already open (pid {pid})", code="already_open")
     log_path = store.log_path(name)
-    fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    os.fchmod(fd, 0o600)
     cmd = [sys.executable, "-m", "fpb", "open", name]
     if url:
         cmd += ["--url", url]
-    env = dict(os.environ, FPB_HOME=str(store.home), PYTHONUNBUFFERED="1")
-    with os.fdopen(fd, "a") as log:
-        log.write(f"\n=== {now_iso()} fpb open --detach ===\n")
-        log.flush()
-        child = subprocess.Popen(
-            cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-            start_new_session=True, close_fds=True, env=env,
-        )
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        info = store.read_run(name)
-        if info and info.get("pid") == child.pid and info.get("ready"):
-            return child.pid
-        if child.poll() is not None:
-            tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
-            raise LaunchError("fpb open exited before the window came up:\n" + "\n".join(tail))
-        time.sleep(0.5)
-    raise LaunchError(f"window did not come up within {timeout:.0f}s; see {log_path}")
+    extctx.remove_stale_handoffs(store, name)
+    handoff = extctx.write_handoff(store, name, ext_context) if ext_context is not None else None
+    if handoff is not None:
+        cmd += ["--ext-context-handoff", str(handoff)]
+    try:
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(fd, 0o600)
+        env = dict(os.environ, FPB_HOME=str(store.home), PYTHONUNBUFFERED="1")
+        with os.fdopen(fd, "a") as log:
+            log.write(f"\n=== {now_iso()} fpb open --detach ===\n")
+            log.flush()
+            child = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True, close_fds=True, env=env,
+            )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            info = store.read_run(name)
+            if info and info.get("pid") == child.pid and info.get("ready"):
+                return info
+            if child.poll() is not None:
+                tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
+                raise LaunchError("fpb open exited before the window came up:\n" + "\n".join(tail))
+            time.sleep(0.5)
+        raise LaunchError(f"window did not come up within {timeout:.0f}s; see {log_path}", code="launch_timeout")
+    finally:
+        if handoff is not None:
+            handoff.unlink(missing_ok=True)

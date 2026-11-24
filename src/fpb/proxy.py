@@ -18,6 +18,8 @@ SCHEMES = ("http", "https", "socks5")
 class ProxyError(ValueError):
     """The proxy URL is not usable. The message never contains the password."""
 
+    code = "invalid_proxy"
+
 
 @dataclass(frozen=True)
 class Proxy:

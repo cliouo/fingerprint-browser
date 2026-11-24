@@ -5,6 +5,7 @@
 Endpoints (JSON):
   POST /api/login     {"username": "demo", "password": "demo-pass"} -> {"data": {"access_token": ...}}
   POST /api/results   any JSON with "items": [...], needs "Authorization: Bearer <token>"
+  POST /api/ext-context  what a test extension's options page stored from `fpb open --ext-context` (no token)
   GET  /runner        a small HTML page for a test extension to open
   GET  /__state       everything recorded so far: logins, requests, results
 
@@ -25,7 +26,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 USER, PASSWORD = "demo", "demo-pass"
-STATE = {"logins": [], "requests": [], "tokens": [], "results": []}
+STATE = {"logins": [], "requests": [], "tokens": [], "results": [], "ext_contexts": []}
 LOCK = threading.Lock()
 STATE_FILE = None
 
@@ -108,6 +109,11 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["logins"].append({"t": time.time(), "client": body.get("client")})
                 persist()
             return self._send(200, {"data": {"access_token": issued}})
+        if path == "/api/ext-context":
+            with LOCK:
+                STATE.setdefault("ext_contexts", []).append({"t": time.time(), **body})
+                persist()
+            return self._send(200, {"ok": True})
         if not self._authed():
             return self._send(401, {"error": "unauthorized"})
         if path == "/api/results":

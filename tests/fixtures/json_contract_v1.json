@@ -1,0 +1,48 @@
+{
+  "_source": "mvp-api.md v1.0, sections 6.2 (fpb --json) and 3.4 (the injected context). Shapes copied as written; values replaced with neutral examples.",
+  "profile_view": {
+    "name": "work1",
+    "state": "open",
+    "pid": 41234,
+    "proxy": "http://user1:***@127.0.0.1:8080",
+    "proxy_user": "user1",
+    "bypass": ["127.0.0.1", "localhost", "api.example.com"],
+    "extensions": [
+      {"path": "/path/to/example-ext/dist", "gecko_id": "example-ext@example.com", "name": "Example Extension", "version": "0.2.0"}
+    ],
+    "identity_digest": "sha256:…",
+    "dir": "/home/user/.fpb/profiles/work1",
+    "error": ""
+  },
+  "profile_view_broken": {"name": "work1", "state": "broken", "error": "…"},
+  "list": {"ok": true, "profiles": []},
+  "show": {"ok": true, "profile": {}},
+  "open_detach": {
+    "ok": true,
+    "name": "work1",
+    "pid": 41234,
+    "log": "…/open.log",
+    "ext_context": {"gecko_id": "example-ext@example.com", "injected": true, "error": ""}
+  },
+  "close": {"ok": true, "name": "work1", "was_open": true, "pid": 41234},
+  "error": {"ok": false, "error": {"code": "...", "message": "..."}},
+  "error_codes": {
+    "show": ["profile_not_found"],
+    "new": ["profile_exists", "invalid_proxy", "invalid_extension", "browser_missing", "identity_failed"],
+    "set-proxy": ["profile_not_found", "profile_open", "invalid_proxy"],
+    "set-bypass": ["profile_not_found", "profile_open", "invalid_bypass"],
+    "set-extensions": ["profile_not_found", "invalid_extension"],
+    "open": ["profile_not_found", "already_open", "browser_missing", "launch_failed", "launch_timeout"],
+    "close": ["close_failed"]
+  },
+  "injected_context": {
+    "v": 1,
+    "daemon_url": "http://127.0.0.1:9000",
+    "daemon_token": "dct_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "channel_id": "ch_12",
+    "host_id": "host-a",
+    "profile": "work1",
+    "proxy_account": "user1",
+    "issued_at": "2026-11-24T08:20:30Z"
+  }
+}

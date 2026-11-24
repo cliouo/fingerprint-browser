@@ -2,11 +2,13 @@ name: linux-e2e
 # A real Camoufox window on Ubuntu (Xvfb): an extension opens and closes
 # runner tabs (as automation extensions do); `fpb open` must keep the
 # window and still end when the window is closed. Runs the earlier close
-# check too (--legacy), for comparison. Downloads the browser (~700 MB).
+# check too (--legacy), for comparison. Also passes a context to the test
+# extension's options page (`fpb open --ext-context`). Downloads the browser (~700 MB).
 on:
   pull_request:
     paths:
       - "src/fpb/launcher.py"
+      - "src/fpb/extctx.py"
       - "scripts/e2e/**"
       - ".github/workflows/linux-e2e.yml"
       - "pyproject.toml"
@@ -27,6 +29,10 @@ jobs:
           sudo apt-get install -y xvfb xdotool libgtk-3-0t64 libdbus-glib-1-2 libasound2t64 libxt6t64 libx11-xcb1
       - run: uv sync --locked
       - run: uv run camoufox fetch
+        env:
+          # camoufox looks the release up through the GitHub API; unauthenticated
+          # calls from shared runners hit the rate limit (403)
+          GITHUB_TOKEN: ${{ github.token }}
       - name: runner tabs under fpb open
         env:
           DISPLAY: ":99"
@@ -46,6 +52,10 @@ jobs:
           echo "::endgroup::"
           echo "::group::proxy bypass for the extension's backend"
           bash scripts/e2e/bypass_check.sh
+          echo "::endgroup::"
+          echo "::group::context passed to an extension's options page"
+          uv run python scripts/e2e/ext_context_check.py --port 8101 | tee "$RUNNER_TEMP/ext-context.txt"
+          test "${PIPESTATUS[0]}" -eq 0
           echo "::endgroup::"
       - if: always()
         uses: actions/upload-artifact@v4
